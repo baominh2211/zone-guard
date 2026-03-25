@@ -1,7 +1,19 @@
+"""Test: Draw zone on webcam -> only detect+track inside zone -> show intrusion alerts.
+
+This is the complete visual test for the zone-as-ROI pipeline.
+Zone polygon = detection ROI + alert zone (one polygon, two purposes).
+
+Controls:
+    LMB         : Add point to zone polygon
+    RMB         : Undo last point
+    S / Enter   : Save zone (lock it, start detecting)
+    E           : Edit zone (unlock, stop detecting)
+    C           : Clear zone completely
+    Q           : Quit
+"""
 import cv2
 import numpy as np
-import sys
-import os
+import sys, os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../src"))
 
@@ -9,207 +21,133 @@ from zone_guard.tracking.byte_tracker import ByteTracker
 from zone_guard.zones.zone_checker import ZoneChecker
 from zone_guard.zones.state_machine import TrackZoneStateManager, ZoneTransition
 
-
-WINDOW_NAME = "Zone Test - Draw with mouse | LMB:add RMB:undo S/Enter:save E:edit C:clear Q:quit"
+WINDOW = "ZoneGuard - Draw Zone then Detect | Q:quit S:save E:edit C:clear"
 ZONE_ID = "zone_01"
 
 # State
-draw_points = []          # điểm vẽ bằng chuột, đơn vị pixel
-zone_checker = None       # ZoneChecker sau khi normalize
-zone_locked = False       # đã chốt zone hay chưa
-frame_w = None
-frame_h = None
+draw_points = []
+zone_polygon_norm = None  # normalised polygon after save
+zone_checker = None
+zone_locked = False
 
+# Tracker starts without zone (will be set after drawing)
 tracker = ByteTracker("models/yolov13n.pt", confidence=0.4, device="cpu")
 state_mgr = TrackZoneStateManager(dwell_frames=3, cooldown_seconds=5)
 
 
-def reset_zone_state():
-    global draw_points, zone_checker, zone_locked, state_mgr
-    draw_points = []
-    zone_checker = None
-    zone_locked = False
-    state_mgr = TrackZoneStateManager(dwell_frames=3, cooldown_seconds=5)
-
-
-def build_zone_checker(points_px, w, h):
-    """Chuyển polygon pixel -> normalized rồi tạo ZoneChecker."""
-    normalized = [[x / w, y / h] for (x, y) in points_px]
-    return ZoneChecker(normalized)
-
-
-def mouse_callback(event, x, y, flags, param):
-    global draw_points, zone_locked
-
+def mouse_cb(event, x, y, flags, param):
+    global draw_points
     if zone_locked:
         return
-
     if event == cv2.EVENT_LBUTTONDOWN:
         draw_points.append((x, y))
-
-    elif event == cv2.EVENT_RBUTTONDOWN:
-        if draw_points:
-            draw_points.pop()
+    elif event == cv2.EVENT_RBUTTONDOWN and draw_points:
+        draw_points.pop()
 
 
 cap = cv2.VideoCapture(0)
-if not cap.isOpened():
-    raise RuntimeError("Không mở được webcam")
-
-cv2.namedWindow(WINDOW_NAME)
-cv2.setMouseCallback(WINDOW_NAME, mouse_callback)
+cv2.namedWindow(WINDOW)
+cv2.setMouseCallback(WINDOW, mouse_cb)
 
 while True:
     ret, frame = cap.read()
     if not ret:
         break
+    h, w = frame.shape[:2]
 
-    frame_h, frame_w = frame.shape[:2]
+    # --- Detect+Track (only if zone is locked) ---
+    tracks = []
+    if zone_locked and zone_polygon_norm:
+        tracks = tracker.update(frame)
 
-    # Track trực tiếp từ frame
-    tracks = tracker.update(frame)
-
-    # ---- Vẽ polygon đang chỉnh / đã chốt ----
-    if len(draw_points) > 0:
-        # Vẽ các điểm
-        for i, (px, py) in enumerate(draw_points):
-            cv2.circle(frame, (px, py), 5, (0, 255, 255), -1)
-            cv2.putText(
-                frame,
-                str(i + 1),
-                (px + 6, py - 6),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                (0, 255, 255),
-                1,
-            )
-
-        # Vẽ các cạnh tạm
-        if len(draw_points) >= 2:
-            pts_np = np.array(draw_points, np.int32)
-            cv2.polylines(frame, [pts_np], False, (0, 255, 255), 2)
-
-        # Nếu đã khóa zone thì vẽ polygon kín màu đỏ
+    # --- Draw zone polygon ---
+    if draw_points:
+        pts_px = np.array(draw_points, np.int32)
         if zone_locked and len(draw_points) >= 3:
-            pts_np = np.array(draw_points, np.int32)
-            cv2.polylines(frame, [pts_np], True, (0, 0, 255), 2)
+            # Locked: dim outside, fill zone
+            mask = np.zeros((h, w), dtype=np.uint8)
+            cv2.fillPoly(mask, [pts_px], 255)
+            frame[mask == 0] = (frame[mask == 0] * 0.3).astype(np.uint8)
+            cv2.polylines(frame, [pts_px], True, (0, 0, 255), 2)
+            cx = int(np.mean([p[0] for p in draw_points]))
+            cy = int(min(p[1] for p in draw_points)) - 10
+            cv2.putText(frame, "RESTRICTED ZONE", (max(10, cx-80), max(20, cy)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        else:
+            # Drawing: show points and lines
+            for pt in draw_points:
+                cv2.circle(frame, pt, 5, (0, 255, 255), -1)
+            if len(draw_points) >= 2:
+                cv2.polylines(frame, [pts_px], False, (0, 255, 255), 2)
 
-            x_text = min(p[0] for p in draw_points)
-            y_text = max(20, min(p[1] for p in draw_points) - 10)
-            cv2.putText(
-                frame,
-                "RESTRICTED",
-                (x_text, y_text),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (0, 0, 255),
-                2,
-            )
-
-    # ---- Check từng track với zone ----
+    # --- Check tracks against zone + draw ---
     active_ids = set()
-
     for t in tracks:
         active_ids.add(t.track_id)
-
         x1, y1, x2, y2 = [int(v) for v in t.bbox]
-        color = (0, 255, 0)
-        inside = False
-        transition = None
 
-        if zone_checker is not None:
-            fx, fy = ZoneChecker.bbox_to_foot_point(t.bbox, frame_w, frame_h)
+        inside = True  # everything inside ROI crop is "inside zone"
+        if zone_checker:
+            fx, fy = ZoneChecker.bbox_to_foot_point(t.bbox, w, h)
             inside = zone_checker.is_inside(fx, fy)
-            transition = state_mgr.update(t.track_id, ZONE_ID, inside)
-            color = (0, 0, 255) if inside else (0, 255, 0)
 
-            # Vẽ foot point
-            foot_x = int((x1 + x2) / 2)
-            foot_y = y2
-            cv2.circle(frame, (foot_x, foot_y), 4, color, -1)
+        transition = state_mgr.update(t.track_id, ZONE_ID, inside)
+        color = (0, 0, 255) if inside else (0, 255, 0)
 
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(
-            frame,
-            f"ID:{t.track_id}",
-            (x1, max(20, y1 - 10)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            color,
-            2,
-        )
+        cv2.putText(frame, f"ID:{t.track_id} {t.confidence:.0%}",
+                    (x1, max(20, y1-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+        # Foot point
+        fpx, fpy = int((x1+x2)/2), y2
+        cv2.circle(frame, (fpx, fpy), 4, color, -1)
 
         if transition == ZoneTransition.INTRUSION_START:
             print(f"🚨 INTRUSION! Track #{t.track_id}")
         elif transition == ZoneTransition.INTRUSION_END:
             print(f"✅ Track #{t.track_id} left zone")
 
-    # Cleanup stale track states
     state_mgr.cleanup_stale(active_ids)
 
-    # Occupancy
-    occ = state_mgr.get_occupancy(ZONE_ID) if zone_checker is not None else 0
-    cv2.putText(
-        frame,
-        f"Zone Occupancy: {occ}",
-        (10, 30),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.8,
-        (0, 255, 255),
-        2,
-    )
+    # --- HUD ---
+    occ = state_mgr.get_occupancy(ZONE_ID) if zone_locked else 0
+    cv2.putText(frame, f"Occupancy: {occ}", (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
 
-    # Hướng dẫn
-    info_lines = [
-        "LMB:add point  RMB:undo",
-        "S or Enter: save zone",
-        "E: edit zone   C: clear   Q: quit",
-    ]
-    for i, line in enumerate(info_lines):
-        cv2.putText(
-            frame,
-            line,
-            (10, frame_h - 50 + i * 18),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (255, 255, 255),
-            1,
-        )
+    status = "DETECTING" if zone_locked else "DRAW ZONE (click points, press S)"
+    cv2.putText(frame, status, (10, h-20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200,200,200), 1)
 
-    if zone_checker is None:
-        cv2.putText(
-            frame,
-            "Zone not set",
-            (10, 60),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 200, 255),
-            2,
-        )
-
-    cv2.imshow(WINDOW_NAME, frame)
+    cv2.imshow(WINDOW, frame)
     key = cv2.waitKey(1) & 0xFF
 
-    if key == ord("q"):
+    if key == ord('q'):
         break
 
-    elif key in (ord("s"), 13):  # 13 = Enter
-        if len(draw_points) >= 3 and frame_w and frame_h:
-            zone_checker = build_zone_checker(draw_points, frame_w, frame_h)
+    elif key in (ord('s'), 13):  # Save/Enter
+        if len(draw_points) >= 3:
+            zone_polygon_norm = [[x/w, y/h] for x, y in draw_points]
+            zone_checker = ZoneChecker(zone_polygon_norm)
+            tracker.set_zone(zone_polygon_norm)  # Set zone as ROI
             zone_locked = True
             state_mgr = TrackZoneStateManager(dwell_frames=3, cooldown_seconds=5)
-            print("[Zone] Saved zone.")
+            print(f"[Zone] Saved: {len(draw_points)} points — now detecting inside zone only")
 
-    elif key == ord("e"):
-        if len(draw_points) >= 3:
-            zone_locked = False
-            zone_checker = None
-            state_mgr = TrackZoneStateManager(dwell_frames=3, cooldown_seconds=5)
-            print("[Zone] Edit mode enabled.")
+    elif key == ord('e'):  # Edit
+        zone_locked = False
+        zone_checker = None
+        zone_polygon_norm = None
+        tracker.set_zone(None)  # Disable ROI
+        state_mgr = TrackZoneStateManager(dwell_frames=3, cooldown_seconds=5)
+        print("[Zone] Edit mode — detection paused")
 
-    elif key == ord("c"):
-        reset_zone_state()
-        print("[Zone] Cleared.")
+    elif key == ord('c'):  # Clear
+        draw_points = []
+        zone_locked = False
+        zone_checker = None
+        zone_polygon_norm = None
+        tracker.set_zone(None)
+        state_mgr = TrackZoneStateManager(dwell_frames=3, cooldown_seconds=5)
+        print("[Zone] Cleared")
 
 cap.release()
 cv2.destroyAllWindows()

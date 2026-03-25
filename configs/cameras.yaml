@@ -1,0 +1,7 @@
+cameras:
+  - id: cam_01
+    name: "My Webcam"
+    url: "0"
+    camera_type: webcam
+    fps_cap: 30
+    enabled: true

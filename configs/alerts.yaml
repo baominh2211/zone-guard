@@ -1,0 +1,11 @@
+alerts:
+  telegram_bot_token: ""
+  telegram_chat_id: ""
+  slack_webhook_url: ""
+  smtp_host: ""
+  smtp_port: 587
+  smtp_user: ""
+  smtp_password: ""
+  smtp_from: ""
+  smtp_to: []
+  rate_limit_per_zone_seconds: 60
